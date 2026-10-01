@@ -6278,7 +6278,7 @@ impl DhtNetworkManager {
                 .map_err(|error| P2PError::Serialization(error.to_string().into()))
         };
         let messages = v1
-            .map(&encode)
+            .map(encode)
             .transpose()
             .and_then(|v1| encode(v2).map(|v2| (v1, v2)));
         let (v1, v2) = match messages {
