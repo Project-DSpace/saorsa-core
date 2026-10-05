@@ -6333,8 +6333,10 @@ impl DhtNetworkManager {
             .next()
             .ok_or_else(|| P2PError::Network(NetworkError::PeerNotFound(peer.to_hex().into())))?;
         let result = self.transport.send_on_channel(&channel, topic, bytes).await;
-        if result.is_err() {
-            self.transport.remove_channel(&channel).await;
+        if let Err(error) = &result {
+            self.transport
+                .remove_channel_after_send_failure(&channel, error)
+                .await;
         }
         result?;
         self.transport

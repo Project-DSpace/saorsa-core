@@ -2990,6 +2990,8 @@ mod tests {
 
     /// 2 MiB — used in builder tests to verify max_message_size configuration.
     const TEST_MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
+    /// A loopback channel ID with no QUIC connection behind it (discard port).
+    const UNCONNECTED_CHANNEL_ID: &str = "127.0.0.1:9";
 
     /// The borrowing frame writer must stay byte-for-byte compatible with the
     /// owned `WireMessage` that receivers decode.
@@ -3576,6 +3578,79 @@ mod tests {
         node1.stop().await?;
         node2.stop().await?;
 
+        Ok(())
+    }
+
+    /// A send failure confined to one stream must not drop a channel whose
+    /// QUIC connection is still open, or the next send redials a live peer.
+    /// A stale-channel failure, or a channel with no open connection behind
+    /// it, still removes the channel.
+    #[tokio::test]
+    async fn send_failure_keeps_channel_only_while_connection_is_open() -> Result<()> {
+        let node1 = P2PNode::new(create_test_node_config()).await?;
+        let node2 = P2PNode::new(create_test_node_config()).await?;
+        node1.start().await?;
+        node2.start().await?;
+
+        let node2_addr = node2
+            .listen_addrs()
+            .await
+            .into_iter()
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| {
+                P2PError::Network(crate::error::NetworkError::InvalidAddress(
+                    "Node 2 did not expose an IPv4 listen address".into(),
+                ))
+            })?;
+        let channel_id = node1.connect_peer(&node2_addr).await?;
+
+        let stalled_write = P2PError::Transport(crate::error::TransportError::SendFailed {
+            kind: crate::error::SendFailureKind::WriteProgressTimeout,
+            reason: "stream write made no progress".into(),
+        });
+        assert!(
+            !node1
+                .transport
+                .remove_channel_after_send_failure(&channel_id, &stalled_write)
+                .await,
+            "a stalled stream on an open connection must keep the channel"
+        );
+        assert!(
+            node1
+                .transport
+                .peer_info_by_channel(&channel_id)
+                .await
+                .is_some()
+        );
+
+        let stale = P2PError::Network(crate::error::NetworkError::PeerNotFound(
+            channel_id.clone().into(),
+        ));
+        assert!(
+            node1
+                .transport
+                .remove_channel_after_send_failure(&channel_id, &stale)
+                .await,
+            "a stale-channel failure must remove the channel"
+        );
+        assert!(
+            node1
+                .transport
+                .peer_info_by_channel(&channel_id)
+                .await
+                .is_none()
+        );
+
+        assert!(
+            node1
+                .transport
+                .remove_channel_after_send_failure(UNCONNECTED_CHANNEL_ID, &stalled_write)
+                .await,
+            "a channel with no open connection must be removed whatever the failure"
+        );
+
+        node1.stop().await?;
+        node2.stop().await?;
         Ok(())
     }
 

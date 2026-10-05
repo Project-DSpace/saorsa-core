@@ -1020,6 +1020,37 @@ impl TransportHandle {
         self.peers.remove(channel_id).is_some()
     }
 
+    /// Remove a channel after a send on it failed, unless only the stream did.
+    ///
+    /// A stale-channel failure means the connection is unusable, so the
+    /// channel goes. Any other failure (an open or write that made no
+    /// progress within the transport's timeout, a reset or unfinished stream)
+    /// is confined to one stream, and while QUIC still holds the connection
+    /// open the channel stays: removing it would report the peer disconnected
+    /// and make the next send redial a connection that is still up, a dial
+    /// that a peer behind NAT cannot accept. A connection that does close is
+    /// removed by the `ConnectionEvent::Lost` handler.
+    ///
+    /// Returns `true` if the channel was removed, `false` if it was kept.
+    pub(crate) async fn remove_channel_after_send_failure(
+        &self,
+        channel_id: &str,
+        error: &P2PError,
+    ) -> bool {
+        if !error.is_stale_channel_send_failure() && self.has_open_connection(channel_id) {
+            return false;
+        }
+        self.remove_channel(channel_id).await;
+        true
+    }
+
+    /// Whether QUIC still holds the connection behind `channel_id` open.
+    fn has_open_connection(&self, channel_id: &str) -> bool {
+        channel_id
+            .parse::<SocketAddr>()
+            .is_ok_and(|addr| self.dual_node.has_open_quic_connection(&addr))
+    }
+
     /// Close a channel's QUIC connection and remove it from all tracking maps.
     ///
     /// Use this when a transport-level connection was established but the
@@ -1770,13 +1801,21 @@ impl TransportHandle {
                         continue;
                     }
 
-                    warn!(
-                        peer = %peer_hex,
-                        channel = %channel_id,
-                        error = %e,
-                        "Channel send failed during active send, removing without retry",
-                    );
-                    self.remove_channel(channel_id).await;
+                    if self.remove_channel_after_send_failure(channel_id, &e).await {
+                        warn!(
+                            peer = %peer_hex,
+                            channel = %channel_id,
+                            error = %e,
+                            "Channel send failed during active send, removing without retry",
+                        );
+                    } else {
+                        warn!(
+                            peer = %peer_hex,
+                            channel = %channel_id,
+                            error = %e,
+                            "Channel send failed during active send, keeping channel (connection still open)",
+                        );
+                    }
                     return Err(e);
                 }
             }
@@ -2274,12 +2313,19 @@ impl TransportHandle {
                             break;
                         }
                         Err(e) => {
-                            warn!(
-                                channel = %channel_id,
-                                error = %e,
-                                "Publish channel failed, removing and trying next",
-                            );
-                            self.remove_channel(channel_id).await;
+                            if self.remove_channel_after_send_failure(channel_id, &e).await {
+                                warn!(
+                                    channel = %channel_id,
+                                    error = %e,
+                                    "Publish channel failed, removing and trying next",
+                                );
+                            } else {
+                                warn!(
+                                    channel = %channel_id,
+                                    error = %e,
+                                    "Publish channel failed, keeping channel (connection still open) and trying next",
+                                );
+                            }
                         }
                     }
                 }

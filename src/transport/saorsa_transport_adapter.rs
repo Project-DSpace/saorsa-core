@@ -1394,6 +1394,19 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         }
     }
 
+    /// Whether either stack's endpoint still holds an open QUIC connection to
+    /// `addr`, in its plain or IPv4-mapped form.
+    ///
+    /// The endpoint's connection map drops a connection as soon as QUIC
+    /// records a close reason, so this reports the connection itself, not
+    /// the outcome of any one stream on it.
+    pub fn has_open_quic_connection(&self, addr: &SocketAddr) -> bool {
+        [&self.v6, &self.v4]
+            .into_iter()
+            .flatten()
+            .any(|node| node.transport.endpoint().has_active_connection(addr))
+    }
+
     /// Check if a peer has a live QUIC connection via either stack.
     ///
     /// Checks the underlying P2pEndpoint's NatTraversalEndpoint connections
