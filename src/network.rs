@@ -28,6 +28,7 @@ use crate::reachability::spawn_acquisition_driver;
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
+use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
 use parking_lot::Mutex as ParkingMutex;
@@ -73,6 +74,23 @@ pub(crate) struct WireMessage {
     /// ML-DSA-65 signature over the signable bytes. Empty if unsigned.
     #[serde(default)]
     pub(crate) signature: Vec<u8>,
+}
+
+/// Borrowing view of a [`WireMessage`] for serialization.
+///
+/// Serializes to exactly the bytes [`WireMessage`] would produce for the
+/// same content (same field order and postcard encoding), so a sender can
+/// frame a payload it only borrows without first copying it into an owned
+/// message. Receivers keep decoding into [`WireMessage`].
+#[derive(Serialize)]
+pub(crate) struct WireMessageRef<'a> {
+    pub(crate) protocol: &'a str,
+    pub(crate) data: &'a [u8],
+    pub(crate) from: &'a PeerId,
+    pub(crate) timestamp: u64,
+    pub(crate) user_agent: &'a str,
+    pub(crate) public_key: &'a [u8],
+    pub(crate) signature: &'a [u8],
 }
 
 /// Operating mode of a P2P node.
@@ -1816,9 +1834,12 @@ impl P2PNode {
         &self,
         peer_id: &PeerId,
         protocol: &str,
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
         addrs: &[MultiAddr],
     ) -> Result<()> {
+        // `Bytes` lets retries and the transport share one buffer; a `Vec<u8>`
+        // converts without copying.
+        let data: Bytes = data.into();
         // Snapshot channel IDs before the send attempt — transport.send_message
         // prunes dead channels from bookkeeping but does NOT close the
         // underlying QUIC connection.  We need the original IDs for
@@ -1850,8 +1871,8 @@ impl P2PNode {
             .map(|info| info.addresses)
             .unwrap_or_default();
 
-        // Clone data for retry — only stale-channel failures are retried, but
-        // transport.send_message consumes the Vec.
+        // Keep a handle for the retry — only stale-channel failures are
+        // retried; cloning `Bytes` shares the buffer.
         let retry_data = data.clone();
 
         // Fast path: try existing connection.
@@ -1958,7 +1979,7 @@ impl P2PNode {
         &self,
         peer_id: &PeerId,
         protocol: &str,
-        data: Vec<u8>,
+        data: Bytes,
         addrs: &[MultiAddr],
         saved_addrs: &[MultiAddr],
         stale_channels: &[String],
@@ -2969,6 +2990,49 @@ mod tests {
 
     /// 2 MiB — used in builder tests to verify max_message_size configuration.
     const TEST_MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
+    /// A loopback channel ID with no QUIC connection behind it (discard port).
+    const UNCONNECTED_CHANNEL_ID: &str = "127.0.0.1:9";
+
+    /// The borrowing frame writer must stay byte-for-byte compatible with the
+    /// owned `WireMessage` that receivers decode.
+    #[test]
+    fn wire_message_ref_serializes_like_wire_message() {
+        let owned = WireMessage {
+            protocol: "/ant/replication/1".to_string(),
+            data: (0..=255u8).cycle().take(70_000).collect(),
+            from: PeerId::from_bytes([7; 32]),
+            timestamp: 1_790_000_000,
+            user_agent: "node/0.27.4".to_string(),
+            public_key: vec![1; 1952],
+            signature: vec![2; 3309],
+        };
+        let borrowed = WireMessageRef {
+            protocol: &owned.protocol,
+            data: &owned.data,
+            from: &owned.from,
+            timestamp: owned.timestamp,
+            user_agent: &owned.user_agent,
+            public_key: &owned.public_key,
+            signature: &owned.signature,
+        };
+
+        let expected = postcard::to_stdvec(&owned).unwrap();
+        let actual = postcard::to_stdvec(&borrowed).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            postcard::experimental::serialized_size(&borrowed).unwrap(),
+            actual.len()
+        );
+
+        let decoded: WireMessage = postcard::from_bytes(&actual).unwrap();
+        assert_eq!(decoded.protocol, owned.protocol);
+        assert_eq!(decoded.data, owned.data);
+        assert_eq!(decoded.from, owned.from);
+        assert_eq!(decoded.timestamp, owned.timestamp);
+        assert_eq!(decoded.user_agent, owned.user_agent);
+        assert_eq!(decoded.public_key, owned.public_key);
+        assert_eq!(decoded.signature, owned.signature);
+    }
 
     #[test]
     fn cached_bootstrap_identity_must_match_handshake_peer() {
@@ -3514,6 +3578,79 @@ mod tests {
         node1.stop().await?;
         node2.stop().await?;
 
+        Ok(())
+    }
+
+    /// A send failure confined to one stream must not drop a channel whose
+    /// QUIC connection is still open, or the next send redials a live peer.
+    /// A stale-channel failure, or a channel with no open connection behind
+    /// it, still removes the channel.
+    #[tokio::test]
+    async fn send_failure_keeps_channel_only_while_connection_is_open() -> Result<()> {
+        let node1 = P2PNode::new(create_test_node_config()).await?;
+        let node2 = P2PNode::new(create_test_node_config()).await?;
+        node1.start().await?;
+        node2.start().await?;
+
+        let node2_addr = node2
+            .listen_addrs()
+            .await
+            .into_iter()
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| {
+                P2PError::Network(crate::error::NetworkError::InvalidAddress(
+                    "Node 2 did not expose an IPv4 listen address".into(),
+                ))
+            })?;
+        let channel_id = node1.connect_peer(&node2_addr).await?;
+
+        let stalled_write = P2PError::Transport(crate::error::TransportError::SendFailed {
+            kind: crate::error::SendFailureKind::WriteProgressTimeout,
+            reason: "stream write made no progress".into(),
+        });
+        assert!(
+            !node1
+                .transport
+                .remove_channel_after_send_failure(&channel_id, &stalled_write)
+                .await,
+            "a stalled stream on an open connection must keep the channel"
+        );
+        assert!(
+            node1
+                .transport
+                .peer_info_by_channel(&channel_id)
+                .await
+                .is_some()
+        );
+
+        let stale = P2PError::Network(crate::error::NetworkError::PeerNotFound(
+            channel_id.clone().into(),
+        ));
+        assert!(
+            node1
+                .transport
+                .remove_channel_after_send_failure(&channel_id, &stale)
+                .await,
+            "a stale-channel failure must remove the channel"
+        );
+        assert!(
+            node1
+                .transport
+                .peer_info_by_channel(&channel_id)
+                .await
+                .is_none()
+        );
+
+        assert!(
+            node1
+                .transport
+                .remove_channel_after_send_failure(UNCONNECTED_CHANNEL_ID, &stalled_write)
+                .await,
+            "a channel with no open connection must be removed whatever the failure"
+        );
+
+        node1.stop().await?;
+        node2.stop().await?;
         Ok(())
     }
 
